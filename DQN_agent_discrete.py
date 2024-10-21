@@ -1,0 +1,302 @@
+import torch
+import torch.optim
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+from collections import namedtuple, deque
+from itertools import count
+import random
+import os
+import cv2
+from datetime import datetime
+
+from traffic3d_multi_junction import Traffic3DMultiJunction
+from arguments import get_args
+
+class DQN(nn.Module):
+    def __init__(self, n_actions):
+        super(DQN, self).__init__()
+        self.conv1 = nn.Conv2d(3, 16, kernel_size=5, stride=2)
+        self.bn1 = nn.BatchNorm2d(16)
+        self.conv2 = nn.Conv2d(16, 32, kernel_size=5, stride=2)
+        self.bn2 = nn.BatchNorm2d(32)
+        self.conv3 = nn.Conv2d(32, 32, kernel_size=5, stride=2)
+        self.bn3 = nn.BatchNorm2d(32)
+        self.conv4 = nn.Conv2d(32, 64, kernel_size=5, stride=2)
+        self.bn4 = nn.BatchNorm2d(64)
+        self.head = nn.Linear(576, n_actions)
+        # self.saved_log_probs = []
+        # self.basic_rewards = []
+
+    def forward(self, x):
+        x = F.relu(self.bn1(self.conv1(x)))
+        x = F.relu(self.bn2(self.conv2(x)))
+        x = F.relu(self.bn3(self.conv3(x)))
+        x = F.relu(self.bn4(self.conv4(x)))
+        return self.head(x.view(x.size(0), -1))
+
+# class DQN1(nn.Module):
+#     def __init__(self, n_actions):
+#         super(DQN1, self).__init__()
+#         self.conv1 = nn.Conv2d(3, 16, kernel_size=5, stride=2)
+#         self.bn1 = nn.BatchNorm2d(16)
+#         self.conv2 = nn.Conv2d(16, 32, kernel_size=5, stride=2)
+#         self.bn2 = nn.BatchNorm2d(32)
+#         self.conv3 = nn.Conv2d(32, 32, kernel_size=5, stride=2)
+#         self.bn3 = nn.BatchNorm2d(32)
+#         self.conv4 = nn.Conv2d(32, 64, kernel_size=5, stride=2)
+#         self.bn4 = nn.BatchNorm2d(64)
+#         self.fc1 = nn.Linear(576, 288)
+#         self.fc2 = nn.Linear(288, 288)
+#         self.head = nn.Linear(288, n_actions)
+#         # self.saved_log_probs = []
+#         # self.basic_rewards = []
+#
+#     def forward(self, x):
+#         x = F.relu(self.bn1(self.conv1(x)))
+#         x = F.relu(self.bn2(self.conv2(x)))
+#         x = F.relu(self.bn3(self.conv3(x)))
+#         x = F.relu(self.bn4(self.conv4(x)))
+#         x = x.view(x.size(0), -1)
+#         x = F.relu(self.fc1(x))
+#         x = F.relu(self.fc2(x))
+#         return self.head(x)
+
+Transition = namedtuple('Transition',
+                        ('state', 'action', 'next_state', 'reward'))
+
+class ReplayBuffer:
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self.memory = deque([],maxlen=capacity)
+        self.position = 0
+
+    def push(self, *args):
+        """Saves a transition."""
+        if len(self.memory) < self.capacity:
+            self.memory.append(None)
+        self.memory[self.position] = Transition(*args)
+        self.position = (self.position + 1) % self.capacity
+
+    def sample(self, batch_size):
+        return random.sample(self.memory, batch_size)
+
+    def __len__(self):
+        return len(self.memory)
+
+
+class DQN_agent_discrete:
+    def __init__(self, args, env):
+        self.args = args
+        self.env = env
+        self.n_actions = env.get_action_space()
+        print('Environment action space: {}'.format(self.n_actions))
+        print('Number of junctions: {}'.format(self.args.num_junctions))
+
+        self.policy_net = []
+        self.target_net = []
+        self.optimizer = []
+        self.buffer = []
+        for i in range(self.args.num_junctions):
+            self.policy_net.append(DQN(self.n_actions))
+            self.target_net.append(DQN(self.n_actions))
+
+
+            if args.load_path != None:
+                load_policy_model = torch.load(self.args.load_path, map_location=lambda storage, loc: storage)
+                self.policy_net[i].load_state_dict(load_policy_model)
+
+            self.target_net[i].load_state_dict(self.policy_net[i].state_dict())
+            self.target_net[i].eval()
+
+            if self.args.cuda:
+                self.policy_net[i].cuda()
+                self.target_net[i].cuda()
+
+            self.optimizer.append(torch.optim.RMSprop(self.policy_net[i].parameters(), lr = self.args.lr))
+
+            self.buffer.append(ReplayBuffer(self.args.buffer_size))
+
+        if not os.path.exists(self.args.save_dir):
+            os.mkdir(self.args.save_dir)
+        self.save_path = os.path.join(self.args.save_dir, 'DQN_simple_light_2Js', 'Seed' + str(self.args.seed))
+        if not os.path.exists(self.save_path):
+            os.mkdir(self.save_path)
+
+    def learn(self):
+        # env.reset()
+        episode_J1_rewards = []
+        episode_J2_rewards = []
+        # episode_J3_rewards = []
+        # episode_J4_rewards = []
+        episode_traffic_load_sum = []
+        print('Learning process starts. Total episodes: {}'.format(self.args.num_episodes))
+        for episode in range(self.args.num_episodes):
+            # Play an episode
+            obs = self.env.reset()
+            # print('Env reset')
+            reward_sum_J1 = 0
+            reward_sum_J2 = 0
+            # reward_sum_J3 = 0
+            # reward_sum_J4 = 0
+            traffic_load_sum = 0
+            for t in range(self.args.episode_length):
+                # Play a frame
+                # Variabalize 210, 160
+                obs_tensor_all = []
+                actions_all = []
+                reward_all = []
+                actions = {"actions": []}
+                for junction_id in range(self.args.num_junctions):
+                    junction_id_str = str(junction_id+1)
+                    obs_tensor = self._preproc_inputs(obs[junction_id_str])
+                    obs_tensor_all.append(obs_tensor)
+                    # if len(self.buffer) < self.args.batch_size:
+                    #     action = self._select_action_random()
+                    # else:
+                    action = self._select_action(obs_tensor, junction_id)
+                    # action = self._select_action_inorder(t)
+                    actions["actions"].append({"junctionId": junction_id_str, "action": str(action)})
+                    actions_all.append(action)
+                    # action = self._select_action_random()
+                    # print('Action selected: {}'.format(action))
+                # env.render()
+                obs_new, reward_all, done, info = self.env.step(actions)
+                # reward_sum += reward
+                # calculate the reward for junction 1 anf junction 2
+                reward_sum_J1 += reward_all[0]
+                reward_sum_J2 += reward_all[1]
+                # reward_sum_J3 += reward_all[2]
+                # reward_sum_J4 += reward_all[3]
+                traffic_load_sum += info['traffic_load']
+                # reward_J1 = -int((-reward_final) % 100)
+                # reward_J2 = int(reward_final / 100)
+                # reward_all.append(reward_J1)
+                # reward_all.append(reward_J2)
+                # reward_sum_J1 += reward_J1
+                # reward_sum_J2 += reward_J2
+
+                obs = obs_new
+                print('[{}] Episode {}, Timestep {}, AJ1:{}, RJ1:{}, AJ2:{}, RJ2:{}, Traffic_load: {}' \
+                        .format(datetime.now(), episode, t, actions_all[0], reward_all[0], actions_all[1], reward_all[1], info['traffic_load']))
+                # print('[{}] Episode {}, Timestep {}, AJ1:{}, RJ1:{}, AJ2:{}, RJ2:{}, AJ3:{}, RJ3:{}, AJ4:{}, RJ4:{}, Traffic_load: {}' \
+                #         .format(datetime.now(), episode, t, actions_all[0], reward_all[0], actions_all[1], reward_all[1], \
+                #         actions_all[2], reward_all[2], actions_all[3], reward_all[3],info['traffic_load']))
+
+                # Store episode data into the buffers
+                for junction_id in range(self.args.num_junctions):
+                    obs_next_tensor = self._preproc_inputs(obs_new[str(junction_id+1)])
+                    obs_tensor = obs_tensor_all[junction_id]
+                    action_tensor = torch.tensor(actions_all[junction_id], dtype=torch.float32).unsqueeze(0)
+                    r_tensor = torch.tensor(reward_all[junction_id], dtype=torch.float32).unsqueeze(0)
+                    if self.args.cuda:
+                        action_tensor = action_tensor.cuda()
+                        r_tensor = r_tensor.cuda()
+                    # save the timestep transitions into the replay buffer
+                    self.buffer[junction_id].push(obs_tensor, action_tensor, obs_next_tensor, r_tensor)
+
+                # Train the networks
+                #print('Optimizing starts')
+                if len(self.buffer[0]) >= self.args.batch_size:
+                    # print('Updating policy network')
+                    for i in range(self.args.num_junctions):
+                        self._optimize_model(self.args.batch_size, i)
+                #print('Optimizing finishes')
+
+                # Update the target network, copying all weights and biases in DQN
+                if t >= self.args.target_update_step and t % self.args.target_update_step == 0:
+                    print('Updating target networks')
+                    for i in range(self.args.num_junctions):
+                        self.target_net[i].load_state_dict(self.policy_net[i].state_dict())
+
+                # if done:
+                #     break
+
+            print('[{}] Episode {} finished. Reward total J1: {}, J2: {}, traffic_load: {}' \
+                  .format(datetime.now(), episode, reward_sum_J1, reward_sum_J2, traffic_load_sum))
+            # print('[{}] Episode {} finished. Reward total J1: {}, J2: {}, J3: {}, J4: {}, traffic_load: {}' \
+            #       .format(datetime.now(), episode, reward_sum_J1, reward_sum_J2, reward_sum_J3, reward_sum_J4, traffic_load_sum))
+            episode_J1_rewards.append(reward_sum_J1)
+            episode_J2_rewards.append(reward_sum_J2)
+            # episode_J3_rewards.append(reward_sum_J3)
+            # episode_J4_rewards.append(reward_sum_J4)
+            episode_traffic_load_sum.append(traffic_load_sum)
+            np.save(self.save_path + '/episode_total_traffic_loads_independentlearning_maxvehicle16.npy', episode_traffic_load_sum)
+            np.save(self.save_path + '/episode_J1_rewards_independentlearning_maxvehicle16.npy', episode_J1_rewards)
+            np.save(self.save_path + '/episode_J2_rewards_independentlearning_maxvehicle16.npy', episode_J2_rewards)
+            # np.save(self.save_path + '/episode_J3_rewards_independentlearning_maxvehicle30.npy', episode_J3_rewards)
+            # np.save(self.save_path + '/episode_J4_rewards_independentlearning_maxvehicle30.npy', episode_J4_rewards)
+            for i in range(self.args.num_junctions):
+                torch.save(self.policy_net[i].state_dict(), self.save_path + '/policy_network_junction' + str(i) + '.pt')
+
+        print('Learning process finished')
+
+    def _preproc_inputs(self, input):
+        x = cv2.resize(input, (100, 100))
+        x = x.transpose(2, 0, 1)
+        x = np.ascontiguousarray(x, dtype=np.float32) / 255
+        x = torch.from_numpy(x)
+        x = x.unsqueeze(0)
+        if self.args.cuda:
+            x = x.cuda()
+        return x
+
+    def _select_action(self, state, junction_id):
+        # global steps_done
+        sample = random.random()
+        # eps_threshold = self.args.eps_end + (self.args.eps_start - self.args.eps_end) * \
+        #     math.exp(-1. * steps_done / self.args.eps_decay)
+        # steps_done += 1
+        if sample > self.args.random_eps:
+            with torch.no_grad():
+                Q_values = self.policy_net[junction_id](state)
+                # print(Q_values)
+                # take the Q_value index with the largest expected return
+                # action_tensor = Q_values.max(1)[1].view(1, 1)
+                action_tensor = torch.argmax(Q_values)
+                # print(action_tensor)
+                action = action_tensor.detach().cpu().numpy().squeeze()
+                return action
+        else:
+            return random.randrange(self.n_actions)
+
+    def _select_action_random(self):
+        return random.randrange(self.n_actions)
+
+    def _select_action_inorder(self, timestep):
+        action = (timestep % (self.n_actions))
+        return action
+
+    def _optimize_model(self, batch_size, junction_id):
+        states, actions, next_states, rewards = Transition(*zip(*self.buffer[junction_id].sample(batch_size)))
+
+        states = torch.cat(states)
+        next_states = torch.cat(next_states)
+        rewards = torch.cat(rewards)
+        actions = torch.cat(actions)
+
+        predicted_values = torch.gather(self.policy_net[junction_id](states), 1, actions.long().unsqueeze(-1)).squeeze(-1)
+        next_state_values = self.target_net[junction_id](next_states).max(1)[0].detach()
+        expected_values = rewards + self.args.gamma * next_state_values
+
+        # Compute loss
+        loss = F.smooth_l1_loss(predicted_values, expected_values)
+
+        # calculate loss
+        self.optimizer[junction_id].zero_grad()
+        loss.backward()
+        self.optimizer[junction_id].step()
+        return
+
+if __name__ == '__main__':
+    args = get_args()
+    env = Traffic3DMultiJunction()
+
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    if args.cuda:
+        torch.cuda.manual_seed(args.seed)
+
+    trainer = DQN_agent_discrete(args, env)
+    print('Run training with seed {}'.format(args.seed))
+    trainer.learn()

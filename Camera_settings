@@ -1,0 +1,10 @@
+
+Side camera:
+position: x -57.05 y 10.26 z -64.65
+rotation: x 6.63   y 0.583 z 0
+scale:    x 1      y 1     z 1
+
+Top camera:
+position: x -57    y 35    z -45
+rotation: x 90     y 0     z 0
+scale:    x 1      y 1     z 1
